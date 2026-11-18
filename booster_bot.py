@@ -61,7 +61,22 @@ def open_booster(headless: bool, debug: bool) -> None:
         browser = p.chromium.launch(headless=headless)
         ctx = browser.new_context(storage_state=str(STATE_FILE) if STATE_FILE.exists() else None)
         page = ctx.new_page()
+        try:
+            _run(page, ctx, headless, debug)
+        except Exception:
+            SHOTS.mkdir(exist_ok=True)
+            try:
+                page.screenshot(path=str(SHOTS / "erreur.png"))
+                log(f"URL au moment de l'erreur : {page.url}")
+            except Exception:
+                pass
+            browser.close()
+            raise
+        browser.close()
 
+
+def _run(page, ctx, headless, debug) -> None:
+    if True:
         page.goto(BOOSTER_URL, wait_until="networkidle")
         if "/login" in page.url:
             login(page)
@@ -74,7 +89,6 @@ def open_booster(headless: bool, debug: bool) -> None:
                 if b.is_visible():
                     log(f"bouton visible : {b.inner_text().strip()!r}")
             input("Mode debug : regarde la page, puis Entree pour fermer...")
-            browser.close()
             return
 
         btn = page.get_by_role("button", name=BUTTON_RE)
@@ -97,8 +111,6 @@ def open_booster(headless: bool, debug: bool) -> None:
             page.screenshot(path=str(shot))
             log(f"Booster ouvert. Capture : {shot.name}")
 
-        browser.close()
-
 
 def main() -> None:
     ap = argparse.ArgumentParser()
@@ -114,6 +126,8 @@ def main() -> None:
             open_booster(headless=not args.debug, debug=args.debug)
         except Exception as e:
             log(f"Erreur : {e}")
+            if not args.loop:
+                sys.exit(1)
         if not args.loop or args.debug:
             break
         time.sleep(600)
