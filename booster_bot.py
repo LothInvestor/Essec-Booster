@@ -68,10 +68,27 @@ def login(page) -> None:
     log("Connecte.")
 
 
+def snapshot(page, tag: str) -> None:
+    """Ecrit dans le log ce que la page affiche (boutons + debut du texte)."""
+    try:
+        log(f"[{tag}] URL : {page.url}")
+        for b in page.get_by_role("button").all():
+            if b.is_visible():
+                label = (b.get_attribute("aria-label") or "") + " | " + b.inner_text().strip()
+                log(f"[{tag}]   bouton : {label!r}")
+        txt = re.sub(r"\s+", " ", page.locator("body").inner_text())[:700]
+        log(f"[{tag}] texte : {txt}")
+    except Exception as e:
+        log(f"[{tag}] snapshot impossible : {e}")
+
+
 def open_booster(headless: bool, debug: bool) -> None:
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless)
-        ctx = browser.new_context(storage_state=str(STATE_FILE) if STATE_FILE.exists() else None)
+        ctx = browser.new_context(
+            storage_state=str(STATE_FILE) if STATE_FILE.exists() else None,
+            viewport={"width": 412, "height": 915},
+        )
         page = ctx.new_page()
         try:
             _run(page, ctx, headless, debug)
@@ -122,7 +139,22 @@ def _run(page, ctx, headless, debug) -> None:
             page.screenshot(path=str(SHOTS / "etat_page.png"))
             return
         btn.first.click(force=True)
-        log("Booster ouvert, recuperation des cartes...")
+        log("Clic sur le booster, attente de la premiere carte...")
+        appeared = page.get_by_text(re.compile(r"clique sur la carte", re.I)).or_(
+            page.get_by_role("button", name=NEXT_RE))
+        try:
+            appeared.first.wait_for(state="visible", timeout=6000)
+        except PWTimeout:
+            snapshot(page, "apres clic 1")
+            log("Rien n'a change, nouvel essai avec un clic JavaScript.")
+            try:
+                btn.first.evaluate("e => e.click()")
+            except Exception as e:
+                log(f"  clic JS impossible : {e}")
+            try:
+                appeared.first.wait_for(state="visible", timeout=6000)
+            except PWTimeout:
+                snapshot(page, "apres clic 2")
 
         # 3) Boucle : reveler la carte, puis "Carte suivante (n/3)" / "Ton booster"
         next_btn = page.get_by_role("button", name=NEXT_RE)
@@ -154,6 +186,7 @@ def _run(page, ctx, headless, debug) -> None:
             page.wait_for_timeout(1000)
 
         page.screenshot(path=str(SHOTS / "etat_final.png"))
+        snapshot(page, "echec")
         raise RuntimeError(f"Sequence incomplete ({cards} carte(s) revelee(s)).")
 
 
