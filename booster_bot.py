@@ -28,8 +28,8 @@ HERE = Path(__file__).resolve().parent
 load_dotenv(HERE / ".env")
 
 BASE = "https://www.essecmasters.com"
-EMAIL = os.getenv("EM_EMAIL")
-PASSWORD = os.getenv("EM_PASSWORD")
+EMAIL = (os.getenv("EM_EMAIL") or "").strip()
+PASSWORD = (os.getenv("EM_PASSWORD") or "").strip()
 BOOSTER_URL = os.getenv("EM_BOOSTER_URL", f"{BASE}/home")
 BUTTON_RE = re.compile(os.getenv("EM_BUTTON_TEXT", "ouvrir|open|booster|tirer"), re.I)
 STATE_FILE = HERE / "session.json"   # garde la session pour ne pas se reconnecter a chaque fois
@@ -50,9 +50,20 @@ def login(page) -> None:
     page.fill("input[type=email]", EMAIL)
     page.fill("input[type=password]", PASSWORD)
     page.get_by_role("button", name=re.compile("log in|connexion|se connecter", re.I)).click()
-    page.wait_for_load_state("networkidle")
-    if "/login" in page.url:
+    try:
+        page.wait_for_url(lambda u: "/login" not in u, timeout=20000)
+    except PWTimeout:
+        # Affiche le message d'erreur du site s'il y en a un
+        for sel in ("[role=alert]", ".error", "[class*=error]", "[class*=toast]"):
+            try:
+                txt = page.locator(sel).first.inner_text(timeout=1000).strip()
+                if txt:
+                    log(f"Message du site : {txt!r}")
+                    break
+            except Exception:
+                pass
         raise RuntimeError("Connexion echouee : verifie EM_EMAIL / EM_PASSWORD.")
+    page.wait_for_load_state("networkidle")
     log("Connecte.")
 
 
