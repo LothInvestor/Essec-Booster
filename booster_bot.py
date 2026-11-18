@@ -112,11 +112,17 @@ def _run(page, ctx, headless, debug) -> None:
             SHOTS.mkdir(exist_ok=True)
             page.screenshot(path=str(SHOTS / "etat_page.png"))
         else:
-            btn.first.click()
+            # Le paquet flotte (animation CSS) : Playwright le juge "instable", on force le clic
+            btn.first.click(force=True)
+            page.wait_for_timeout(5000)
             try:
                 page.wait_for_load_state("networkidle", timeout=15000)
             except PWTimeout:
                 pass
+            for b in page.get_by_role("button").all():
+                if b.is_visible():
+                    label = b.get_attribute("aria-label") or b.inner_text().strip()
+                    log(f"  bouton apres clic : {label!r}")
             SHOTS.mkdir(exist_ok=True)
             shot = SHOTS / f"booster_{datetime.now():%Y%m%d_%H%M%S}.png"
             page.screenshot(path=str(shot))
