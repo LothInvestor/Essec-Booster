@@ -31,7 +31,8 @@ BASE = "https://www.essecmasters.com"
 EMAIL = (os.getenv("EM_EMAIL") or "").strip()
 PASSWORD = (os.getenv("EM_PASSWORD") or "").strip()
 BOOSTER_URL = os.getenv("EM_BOOSTER_URL", f"{BASE}/home")
-BUTTON_RE = re.compile(os.getenv("EM_BUTTON_TEXT", "ouvrir|open|booster|tirer"), re.I)
+BUTTON_RE = re.compile(os.getenv("EM_BUTTON_TEXT", "open the booster|ouvrir|tirer"), re.I)
+NEXT_RE = re.compile(r"carte suivante|ton booster", re.I)
 STATE_FILE = HERE / "session.json"   # garde la session pour ne pas se reconnecter a chaque fois
 LOG_FILE = HERE / "booster_bot.log"
 SHOTS = HERE / "screenshots"
@@ -102,6 +103,15 @@ def _run(page, ctx, headless, debug) -> None:
             input("Mode debug : regarde la page, puis Entree pour fermer...")
             return
 
+        SHOTS.mkdir(exist_ok=True)
+
+        # 1) Cooldown actif ? (le site affiche "PROCHAIN BOOSTER DANS m:ss")
+        if page.get_by_text(re.compile("prochain booster", re.I)).count() > 0:
+            m = re.search(r"(\d+:\d{2})", page.locator("body").inner_text())
+            log(f"Cooldown en cours, prochain booster dans {m.group(1) if m else '?'}.")
+            return
+
+        # 2) Ouvrir le booster (le paquet flotte : on force le clic)
         btn = page.get_by_role("button", name=BUTTON_RE)
         if btn.count() == 0 or not btn.first.is_enabled():
             log("Aucun booster disponible (bouton absent ou desactive).")
@@ -109,24 +119,85 @@ def _run(page, ctx, headless, debug) -> None:
             for b in page.get_by_role("button").all():
                 if b.is_visible():
                     log(f"  bouton visible : {b.inner_text().strip()!r}")
-            SHOTS.mkdir(exist_ok=True)
             page.screenshot(path=str(SHOTS / "etat_page.png"))
-        else:
-            # Le paquet flotte (animation CSS) : Playwright le juge "instable", on force le clic
-            btn.first.click(force=True)
-            page.wait_for_timeout(5000)
+            return
+        btn.first.click(force=True)
+        log("Booster ouvert, recuperation des cartes...")
+
+        # 3) Boucle : reveler la carte, puis "Carte suivante (n/3)" / "Ton booster"
+        next_btn = page.get_by_role("button", name=NEXT_RE)
+        hint = page.get_by_text(re.compile(r"clique sur la carte", re.I))
+        cards = 0
+        for _ in range(12):
             try:
-                page.wait_for_load_state("networkidle", timeout=15000)
+                next_btn.first.wait_for(state="visible", timeout=1500)
+                label = next_btn.first.inner_text().strip()
+                page.screenshot(path=str(SHOTS / f"carte_{cards}.png"))
+                log(f"  clic sur {label!r}")
+                next_btn.first.click(force=True)
+                if re.search(r"ton booster", label, re.I):
+                    page.wait_for_timeout(2000)
+                    log(f"Booster complet : {cards} carte(s) recuperee(s).")
+                    page.screenshot(path=str(SHOTS / "fin.png"))
+                    return
+                page.wait_for_timeout(800)
+                continue
             except PWTimeout:
                 pass
-            for b in page.get_by_role("button").all():
-                if b.is_visible():
-                    label = b.get_attribute("aria-label") or b.inner_text().strip()
-                    log(f"  bouton apres clic : {label!r}")
-            SHOTS.mkdir(exist_ok=True)
-            shot = SHOTS / f"booster_{datetime.now():%Y%m%d_%H%M%S}.png"
-            page.screenshot(path=str(shot))
-            log(f"Booster ouvert. Capture : {shot.name}")
+
+            if hint.count() > 0 and hint.first.is_visible():
+                if reveal_card(page, hint, next_btn):
+                    cards += 1
+                    continue
+                log("Impossible de reveler la carte.")
+                break
+            page.wait_for_timeout(1000)
+
+        page.screenshot(path=str(SHOTS / "etat_final.png"))
+        raise RuntimeError(f"Sequence incomplete ({cards} carte(s) revelee(s)).")
+
+
+def reveal_card(page, hint, next_btn) -> bool:
+    """Clique sur la carte face cachee. Plusieurs methodes, on s'arrete des que ca marche."""
+    def done() -> bool:
+        try:
+            next_btn.first.wait_for(state="visible", timeout=4000)
+            return True
+        except PWTimeout:
+            return False
+
+    # a) un vrai bouton "reveler / carte"
+    cand = page.get_by_role(
+        "button", name=re.compile(r"^(?!.*(suivante|ton booster)).*(reveal|révél|revel|card|carte)", re.I)
+    )
+    if cand.count() > 0:
+        cand.first.click(force=True)
+        if done():
+            return True
+    # b) le plus grand element cliquable (curseur "pointer") du panneau de la carte
+    found = page.evaluate("""() => {
+      const hint = [...document.querySelectorAll('*')].find(
+        e => e.children.length === 0 && /clique sur la carte/i.test(e.textContent || ''));
+      if (!hint) return false;
+      let panel = hint;
+      for (let i = 0; i < 4 && panel.parentElement; i++) panel = panel.parentElement;
+      const c = [...panel.querySelectorAll('*')].filter(e => getComputedStyle(e).cursor === 'pointer');
+      if (!c.length) return false;
+      c.sort((a, b) => {
+        const ra = a.getBoundingClientRect(), rb = b.getBoundingClientRect();
+        return rb.width * rb.height - ra.width * ra.height;
+      });
+      c[0].setAttribute('data-bot-card', '1');
+      return true;
+    }""")
+    if found:
+        page.locator("[data-bot-card='1']").first.click(force=True)
+        page.evaluate("document.querySelectorAll('[data-bot-card]').forEach(e => e.removeAttribute('data-bot-card'))")
+        if done():
+            return True
+    # c) dernier recours : cliquer sur le texte d'aide
+    hint.first.click(force=True)
+    return done()
 
 
 def main() -> None:

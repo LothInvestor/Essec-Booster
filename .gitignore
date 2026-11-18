@@ -1,0 +1,5 @@
+session.json
+screenshots/
+booster_bot.log
+__pycache__/
+.env
