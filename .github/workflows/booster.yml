@@ -1,0 +1,28 @@
+name: Booster
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: playwright install --with-deps chromium
+      - run: python booster_bot.py
+        env:
+          EM_EMAIL: ${{ secrets.EM_EMAIL }}
+          EM_PASSWORD: ${{ secrets.EM_PASSWORD }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: captures
+          path: screenshots/
+          if-no-files-found: ignore
