@@ -1,17 +1,14 @@
 """
-Bot Essec Masters : ouvre un booster a chaque execution.
-Planifie-le toutes les 10 min (Planificateur de taches Windows) ou lance-le avec --loop.
+Bot Essec Masters : ouvre un booster (3 cartes) a chaque execution.
+Planifie via GitHub Actions (voir .github/workflows/booster.yml).
 
-Installation (une fois) :
-    pip install playwright python-dotenv
-    playwright install chromium
+Le site s'affiche en anglais ou en francais selon le navigateur : tous les textes
+recherches ci-dessous existent donc en deux langues.
 
-Fichier .env a cote du script :
-    EM_EMAIL=ton.email@essec.edu
-    EM_PASSWORD=ton_mot_de_passe
-    # Optionnels, a ajuster apres avoir inspecte le site (voir --debug) :
-    EM_BOOSTER_URL=https://www.essecmasters.com/home
-    EM_BUTTON_TEXT=ouvrir|open|booster|tirer
+Test en local (Windows) :
+    pip install playwright python-dotenv && playwright install chromium
+    fichier .env : EM_EMAIL=... et EM_PASSWORD=...
+    python booster_bot.py --debug
 """
 import argparse
 import os
@@ -31,9 +28,17 @@ BASE = "https://www.essecmasters.com"
 EMAIL = (os.getenv("EM_EMAIL") or "").strip()
 PASSWORD = (os.getenv("EM_PASSWORD") or "").strip()
 BOOSTER_URL = os.getenv("EM_BOOSTER_URL", f"{BASE}/home")
-BUTTON_RE = re.compile(os.getenv("EM_BUTTON_TEXT", "open the booster|ouvrir|tirer"), re.I)
-NEXT_RE = re.compile(r"carte suivante|ton booster", re.I)
-STATE_FILE = HERE / "session.json"   # garde la session pour ne pas se reconnecter a chaque fois
+
+PACK_RE = re.compile(r"open the booster|ouvrir|tirer", re.I)
+COOLDOWN_RE = re.compile(r"next booster in|prochain booster", re.I)
+HINT_RE = re.compile(r"click the card|clique sur la carte", re.I)
+REVEAL_RE = re.compile(r"reveal the card|r[ée]v[ée]ler la carte", re.I)
+NEXT_RE = re.compile(
+    r"next card|carte suivante|your booster|ton booster|my booster|collect|r[ée]cup[ée]rer|claim", re.I
+)
+FINAL_RE = re.compile(r"your booster|ton booster|my booster|collect|r[ée]cup[ée]rer|claim", re.I)
+
+STATE_FILE = HERE / "session.json"
 LOG_FILE = HERE / "booster_bot.log"
 SHOTS = HERE / "screenshots"
 
@@ -45,6 +50,20 @@ def log(msg: str) -> None:
         f.write(line + "\n")
 
 
+def snapshot(page, tag: str) -> None:
+    """Ecrit dans le log ce que la page affiche (boutons + debut du texte)."""
+    try:
+        log(f"[{tag}] URL : {page.url}")
+        for b in page.get_by_role("button").all():
+            if b.is_visible():
+                label = (b.get_attribute("aria-label") or "") + " | " + b.inner_text().strip()[:60]
+                log(f"[{tag}]   bouton : {label!r}")
+        txt = re.sub(r"\s+", " ", page.locator("body").inner_text())[:500]
+        log(f"[{tag}] texte : {txt}")
+    except Exception as e:
+        log(f"[{tag}] snapshot impossible : {e}")
+
+
 def login(page) -> None:
     log("Connexion...")
     page.goto(f"{BASE}/login", wait_until="networkidle")
@@ -54,32 +73,9 @@ def login(page) -> None:
     try:
         page.wait_for_url(lambda u: "/login" not in u, timeout=20000)
     except PWTimeout:
-        # Affiche le message d'erreur du site s'il y en a un
-        for sel in ("[role=alert]", ".error", "[class*=error]", "[class*=toast]"):
-            try:
-                txt = page.locator(sel).first.inner_text(timeout=1000).strip()
-                if txt:
-                    log(f"Message du site : {txt!r}")
-                    break
-            except Exception:
-                pass
         raise RuntimeError("Connexion echouee : verifie EM_EMAIL / EM_PASSWORD.")
     page.wait_for_load_state("networkidle")
     log("Connecte.")
-
-
-def snapshot(page, tag: str) -> None:
-    """Ecrit dans le log ce que la page affiche (boutons + debut du texte)."""
-    try:
-        log(f"[{tag}] URL : {page.url}")
-        for b in page.get_by_role("button").all():
-            if b.is_visible():
-                label = (b.get_attribute("aria-label") or "") + " | " + b.inner_text().strip()
-                log(f"[{tag}]   bouton : {label!r}")
-        txt = re.sub(r"\s+", " ", page.locator("body").inner_text())[:700]
-        log(f"[{tag}] texte : {txt}")
-    except Exception as e:
-        log(f"[{tag}] snapshot impossible : {e}")
 
 
 def open_booster(headless: bool, debug: bool) -> None:
@@ -91,12 +87,12 @@ def open_booster(headless: bool, debug: bool) -> None:
         )
         page = ctx.new_page()
         try:
-            _run(page, ctx, headless, debug)
+            _run(page, ctx, debug)
         except Exception:
             SHOTS.mkdir(exist_ok=True)
             try:
                 page.screenshot(path=str(SHOTS / "erreur.png"))
-                log(f"URL au moment de l'erreur : {page.url}")
+                snapshot(page, "erreur")
             except Exception:
                 pass
             browser.close()
@@ -104,143 +100,84 @@ def open_booster(headless: bool, debug: bool) -> None:
         browser.close()
 
 
-def _run(page, ctx, headless, debug) -> None:
-    if True:
+def _run(page, ctx, debug: bool) -> None:
+    page.goto(BOOSTER_URL, wait_until="networkidle")
+    if "/login" in page.url:
+        login(page)
         page.goto(BOOSTER_URL, wait_until="networkidle")
-        if "/login" in page.url:
-            login(page)
-            page.goto(BOOSTER_URL, wait_until="networkidle")
-        ctx.storage_state(path=str(STATE_FILE))
+    ctx.storage_state(path=str(STATE_FILE))
+    SHOTS.mkdir(exist_ok=True)
 
-        if debug:
-            # Liste les boutons visibles pour trouver le bon texte a mettre dans EM_BUTTON_TEXT
-            for b in page.get_by_role("button").all():
-                if b.is_visible():
-                    log(f"bouton visible : {b.inner_text().strip()!r}")
-            input("Mode debug : regarde la page, puis Entree pour fermer...")
-            return
+    if debug:
+        snapshot(page, "debug")
+        input("Mode debug : regarde la page, puis Entree pour fermer...")
+        return
 
-        SHOTS.mkdir(exist_ok=True)
-
-        # 1) Cooldown actif ? (le site affiche "PROCHAIN BOOSTER DANS m:ss")
-        if page.get_by_text(re.compile("prochain booster", re.I)).count() > 0:
-            m = re.search(r"(\d+:\d{2})", page.locator("body").inner_text())
+    pack = page.get_by_role("button", name=PACK_RE)
+    if pack.count() == 0 or not pack.first.is_enabled():
+        # Pas de paquet : on est en cooldown (ou la page a change)
+        m = re.search(r"(\d+:\d{2})", page.locator("body").inner_text())
+        if page.get_by_text(COOLDOWN_RE).count() > 0:
             log(f"Cooldown en cours, prochain booster dans {m.group(1) if m else '?'}.")
-            return
-
-        # 2) Ouvrir le booster (le paquet flotte : on force le clic)
-        btn = page.get_by_role("button", name=BUTTON_RE)
-        if btn.count() == 0 or not btn.first.is_enabled():
-            log("Aucun booster disponible (bouton absent ou desactive).")
-            log(f"URL actuelle : {page.url}")
-            for b in page.get_by_role("button").all():
-                if b.is_visible():
-                    log(f"  bouton visible : {b.inner_text().strip()!r}")
+        else:
+            log("Aucun paquet trouve et pas de compte a rebours : la page a peut-etre change.")
+            snapshot(page, "pas de paquet")
             page.screenshot(path=str(SHOTS / "etat_page.png"))
-            return
-        btn.first.click(force=True)
-        log("Clic sur le booster, attente de la premiere carte...")
-        appeared = page.get_by_text(re.compile(r"clique sur la carte", re.I)).or_(
-            page.get_by_role("button", name=NEXT_RE))
-        try:
-            appeared.first.wait_for(state="visible", timeout=6000)
-        except PWTimeout:
-            snapshot(page, "apres clic 1")
-            log("Rien n'a change, nouvel essai avec un clic JavaScript.")
-            try:
-                btn.first.evaluate("e => e.click()")
-            except Exception as e:
-                log(f"  clic JS impossible : {e}")
-            try:
-                appeared.first.wait_for(state="visible", timeout=6000)
-            except PWTimeout:
-                snapshot(page, "apres clic 2")
+        return
 
-        # 3) Boucle : reveler la carte, puis "Carte suivante (n/3)" / "Ton booster"
-        next_btn = page.get_by_role("button", name=NEXT_RE)
-        hint = page.get_by_text(re.compile(r"clique sur la carte", re.I))
-        cards = 0
-        for _ in range(12):
-            try:
-                next_btn.first.wait_for(state="visible", timeout=1500)
-                label = next_btn.first.inner_text().strip()
-                page.screenshot(path=str(SHOTS / f"carte_{cards}.png"))
-                log(f"  clic sur {label!r}")
-                next_btn.first.click(force=True)
-                if re.search(r"ton booster", label, re.I):
-                    page.wait_for_timeout(2000)
-                    log(f"Booster complet : {cards} carte(s) recuperee(s).")
-                    page.screenshot(path=str(SHOTS / "fin.png"))
-                    return
-                page.wait_for_timeout(800)
-                continue
-            except PWTimeout:
-                pass
-
-            if hint.count() > 0 and hint.first.is_visible():
-                if reveal_card(page, hint, next_btn):
-                    cards += 1
-                    continue
-                log("Impossible de reveler la carte.")
-                break
-            page.wait_for_timeout(1000)
-
-        page.screenshot(path=str(SHOTS / "etat_final.png"))
-        snapshot(page, "echec")
-        raise RuntimeError(f"Sequence incomplete ({cards} carte(s) revelee(s)).")
-
-
-def reveal_card(page, hint, next_btn) -> bool:
-    """Clique sur la carte face cachee. Plusieurs methodes, on s'arrete des que ca marche."""
-    def done() -> bool:
-        try:
-            next_btn.first.wait_for(state="visible", timeout=4000)
-            return True
-        except PWTimeout:
-            return False
-
-    # a) un vrai bouton "reveler / carte"
-    cand = page.get_by_role(
-        "button", name=re.compile(r"^(?!.*(suivante|ton booster)).*(reveal|révél|revel|card|carte)", re.I)
+    # 1) Ouvrir le paquet (il flotte : clic force). Les 3 cartes sont attribuees des ce clic.
+    pack.first.click(force=True)
+    log("Clic sur le booster.")
+    first_ui = (
+        page.get_by_role("button", name=REVEAL_RE)
+        .or_(page.get_by_role("button", name=NEXT_RE))
+        .or_(page.get_by_text(HINT_RE))
     )
-    if cand.count() > 0:
-        cand.first.click(force=True)
-        if done():
-            return True
-    # b) le plus grand element cliquable (curseur "pointer") du panneau de la carte
-    found = page.evaluate("""() => {
-      const hint = [...document.querySelectorAll('*')].find(
-        e => e.children.length === 0 && /clique sur la carte/i.test(e.textContent || ''));
-      if (!hint) return false;
-      let panel = hint;
-      for (let i = 0; i < 4 && panel.parentElement; i++) panel = panel.parentElement;
-      const c = [...panel.querySelectorAll('*')].filter(e => getComputedStyle(e).cursor === 'pointer');
-      if (!c.length) return false;
-      c.sort((a, b) => {
-        const ra = a.getBoundingClientRect(), rb = b.getBoundingClientRect();
-        return rb.width * rb.height - ra.width * ra.height;
-      });
-      c[0].setAttribute('data-bot-card', '1');
-      return true;
-    }""")
-    if found:
-        page.locator("[data-bot-card='1']").first.click(force=True)
-        page.evaluate("document.querySelectorAll('[data-bot-card]').forEach(e => e.removeAttribute('data-bot-card'))")
-        if done():
-            return True
-    # c) dernier recours : cliquer sur le texte d'aide
-    hint.first.click(force=True)
-    return done()
+    try:
+        first_ui.first.wait_for(state="visible", timeout=10000)
+    except PWTimeout:
+        snapshot(page, "apres clic")
+        page.screenshot(path=str(SHOTS / "etat_final.png"))
+        raise RuntimeError("Le booster ne semble pas s'etre ouvert.")
+    log("Booster ouvert, 3 cartes recuperees. Deroule de l'animation...")
+
+    # 2) Animation : reveler la carte, puis "Carte suivante", x3 (au mieux, pas bloquant)
+    reveal = page.get_by_role("button", name=REVEAL_RE)
+    nxt = page.get_by_role("button", name=NEXT_RE)
+    done = 0
+    for _ in range(8):
+        if reveal.count() > 0 and reveal.first.is_visible():
+            reveal.first.click(force=True)
+            page.wait_for_timeout(1200)
+            page.screenshot(path=str(SHOTS / f"carte_{done + 1}.png"))
+        if nxt.count() > 0 and nxt.first.is_visible():
+            label = nxt.first.inner_text().strip() or nxt.first.get_attribute("aria-label") or ""
+            nxt.first.click(force=True)
+            done += 1
+            log(f"  carte {done}/3 vue, clic sur {label!r}")
+            page.wait_for_timeout(1200)
+            if FINAL_RE.search(label) or done >= 3:
+                break
+        else:
+            page.wait_for_timeout(800)
+
+    page.screenshot(path=str(SHOTS / "fin.png"))
+    if done < 3:
+        # Les cartes sont deja dans la collection : on signale sans faire echouer le run.
+        log(f"Animation incomplete ({done}/3), mais le booster est bien recupere.")
+        snapshot(page, "animation incomplete")
+    else:
+        log("Booster complet : 3 cartes recuperees.")
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--loop", action="store_true", help="tourne en continu toutes les 10 min")
-    ap.add_argument("--debug", action="store_true", help="navigateur visible + liste des boutons")
+    ap.add_argument("--loop", action="store_true", help="tourne en continu toutes les 5 min")
+    ap.add_argument("--debug", action="store_true", help="navigateur visible + etat de la page")
     args = ap.parse_args()
 
     if not EMAIL or not PASSWORD:
-        sys.exit("Renseigne EM_EMAIL et EM_PASSWORD dans le fichier .env")
+        sys.exit("Renseigne EM_EMAIL et EM_PASSWORD (fichier .env ou secrets GitHub)")
 
     while True:
         try:
@@ -251,7 +188,7 @@ def main() -> None:
                 sys.exit(1)
         if not args.loop or args.debug:
             break
-        time.sleep(600)
+        time.sleep(300)
 
 
 if __name__ == "__main__":
