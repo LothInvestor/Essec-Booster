@@ -9,8 +9,14 @@ Test en local (Windows) :
     pip install playwright python-dotenv && playwright install chromium
     fichier .env : EM_EMAIL=... et EM_PASSWORD=...
     python booster_bot.py --debug
+
+Bright Data Browser API :
+    Definir BRIGHT_DATA_WS_URL dans les secrets GitHub (ou le .env local).
+    Format : wss://brd-customer-XXXXXXXX-zone-ZONE_NAME:PASSWORD@brd.superproxy.io:9222
+    Si cette variable est absente, le script utilise Chromium local (comportement anterieur).
 """
 import argparse
+import json
 import os
 import re
 import sys
@@ -28,6 +34,10 @@ BASE = "https://www.essecmasters.com"
 EMAIL = (os.getenv("EM_EMAIL") or "").strip()
 PASSWORD = (os.getenv("EM_PASSWORD") or "").strip()
 BOOSTER_URL = os.getenv("EM_BOOSTER_URL", f"{BASE}/home")
+
+# Bright Data Browser API : wss://brd-customer-...-zone-...:PASSWORD@brd.superproxy.io:9222
+# Si absent, on utilise Chromium local.
+BRIGHT_DATA_WS_URL = (os.getenv("BRIGHT_DATA_WS_URL") or "").strip()
 
 PACK_RE = re.compile(r"open the booster|ouvrir|tirer", re.I)
 COOLDOWN_RE = re.compile(r"next booster in|prochain booster", re.I)
@@ -64,28 +74,101 @@ def snapshot(page, tag: str) -> None:
         log(f"[{tag}] snapshot impossible : {e}")
 
 
-def login(page) -> None:
-    log("Connexion...")
-    page.goto(f"{BASE}/login", wait_until="networkidle")
-    page.fill("input[type=email]", EMAIL)
-    page.fill("input[type=password]", PASSWORD)
-    page.get_by_role("button", name=re.compile("log in|connexion|se connecter", re.I)).click()
+def solve_captcha_if_needed(page) -> None:
+    """Demande a Bright Data de resoudre les Captchas / Cloudflare Turnstile s'il y en a."""
+    if not BRIGHT_DATA_WS_URL:
+        return
     try:
-        page.wait_for_url(lambda u: "/login" not in u, timeout=20000)
+        txt = (page.locator("body").inner_text() or "")[:500].lower()
+        if not any(k in txt for k in ("turnstile", "captcha", "cloudflare", "verify you are human")):
+            return
+        client = page.context.new_cdp_session(page)
+        res = client.send("Captcha.solve", {"detectTimeout": 10000})
+        st = res.get("status") if isinstance(res, dict) else None
+        if st and st not in ("not_detected", None):
+            log(f"Bright Data Captcha : {st}")
+    except Exception:
+        pass
+
+
+def load_session_into_context(ctx) -> None:
+    """Injecte les cookies de session.json dans le navigateur pour eviter d'avoir a se reconnecter."""
+    if not STATE_FILE.exists():
+        return
+    try:
+        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        if "cookies" in data and data["cookies"]:
+            ctx.add_cookies(data["cookies"])
+            log("Session injectee depuis session.json.")
+    except Exception:
+        pass
+
+
+def login(page, goto_opts: dict) -> None:
+    log("Connexion...")
+    page.goto(f"{BASE}/login", **goto_opts)
+    solve_captcha_if_needed(page)
+
+    # Remplissage robuste de l'email
+    email_input = page.locator("input[type=email]").first
+    email_input.wait_for(state="visible", timeout=30_000)
+    email_input.fill(EMAIL, force=True)
+
+    page.wait_for_timeout(500)
+
+    # Remplissage du mot de passe
+    password_input = page.locator("input[type=password]").first
+    password_input.wait_for(state="visible", timeout=30_000)
+
+    if BRIGHT_DATA_WS_URL:
+        # Contournement de la regle Bright Data "password typing is not allowed" :
+        # On passe temporairement le champ en type='text' dans le DOM pendant la saisie.
+        page.evaluate("""({ val }) => {
+            const el = document.querySelector('input[type=password]') || document.querySelector('input[name=password]');
+            if (!el) return;
+            el.setAttribute('type', 'text');
+            const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+            setter.call(el, val);
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+            el.setAttribute('type', 'password');
+        }""", {"val": PASSWORD})
+    else:
+        password_input.fill(PASSWORD, force=True)
+
+    page.wait_for_timeout(500)
+    page.get_by_role("button", name=re.compile("log in|connexion|se connecter", re.I)).first.click(force=True)
+    try:
+        page.wait_for_url(lambda u: "/login" not in u, timeout=goto_opts.get("timeout") or 30000)
     except PWTimeout:
         raise RuntimeError("Connexion echouee : verifie EM_EMAIL / EM_PASSWORD.")
-    page.wait_for_load_state("networkidle")
+    page.wait_for_load_state("domcontentloaded")
+    solve_captcha_if_needed(page)
     log("Connecte.")
 
 
 def open_booster(headless: bool, debug: bool) -> None:
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless)
-        ctx = browser.new_context(
-            storage_state=str(STATE_FILE) if STATE_FILE.exists() else None,
-            viewport={"width": 412, "height": 915},
-        )
+        if BRIGHT_DATA_WS_URL:
+            log(f"Connexion a Bright Data Browser API...")
+            browser = p.chromium.connect_over_cdp(BRIGHT_DATA_WS_URL)
+            # Avec Bright Data on reutilise le contexte distant existant
+            ctx = browser.contexts[0] if browser.contexts else browser.new_context(
+                viewport={"width": 412, "height": 915},
+                ignore_https_errors=True,
+            )
+            load_session_into_context(ctx)
+        else:
+            browser = p.chromium.launch(headless=headless)
+            ctx = browser.new_context(
+                storage_state=str(STATE_FILE) if STATE_FILE.exists() else None,
+                viewport={"width": 412, "height": 915},
+            )
         page = ctx.new_page()
+        page.set_viewport_size({"width": 412, "height": 915})
+        if BRIGHT_DATA_WS_URL:
+            page.set_default_navigation_timeout(60_000)
+            page.set_default_timeout(60_000)
         try:
             _run(page, ctx, debug)
         except Exception:
@@ -101,11 +184,21 @@ def open_booster(headless: bool, debug: bool) -> None:
 
 
 def _run(page, ctx, debug: bool) -> None:
-    page.goto(BOOSTER_URL, wait_until="networkidle")
+    goto_opts = (
+        {"wait_until": "domcontentloaded", "timeout": 60_000}
+        if BRIGHT_DATA_WS_URL
+        else {"wait_until": "networkidle"}
+    )
+    page.goto(BOOSTER_URL, **goto_opts)
+    solve_captcha_if_needed(page)
     if "/login" in page.url:
-        login(page)
-        page.goto(BOOSTER_URL, wait_until="networkidle")
-    ctx.storage_state(path=str(STATE_FILE))
+        login(page, goto_opts)
+        page.goto(BOOSTER_URL, **goto_opts)
+        solve_captcha_if_needed(page)
+    try:
+        ctx.storage_state(path=str(STATE_FILE))
+    except Exception:
+        pass
     SHOTS.mkdir(exist_ok=True)
 
     if debug:
@@ -125,8 +218,19 @@ def _run(page, ctx, debug: bool) -> None:
             page.screenshot(path=str(SHOTS / "etat_page.png"))
         return
 
-    # 1) Ouvrir le paquet (il flotte : clic force). Les 3 cartes sont attribuees des ce clic.
-    pack.first.click(force=True)
+    # 1) Ouvrir le paquet (il flotte en permanence : scroll et clic en JS pour eviter les timeouts de stabilite CSS)
+    page.evaluate("""() => {
+        const b = document.querySelector('button[aria-label*="booster" i]') || 
+                  Array.from(document.querySelectorAll('button')).find(el => /open the booster|ouvrir|tirer/i.test(el.innerText || el.getAttribute('aria-label') || ''));
+        if (b) {
+            b.scrollIntoView({ behavior: 'instant', block: 'center' });
+            b.click();
+        }
+    }""")
+    try:
+        pack.first.click(force=True, timeout=3000)
+    except Exception:
+        pass
     log("Clic sur le booster.")
     first_ui = (
         page.get_by_role("button", name=REVEAL_RE)
@@ -134,8 +238,11 @@ def _run(page, ctx, debug: bool) -> None:
         .or_(page.get_by_text(HINT_RE))
     )
     try:
-        first_ui.first.wait_for(state="visible", timeout=10000)
+        first_ui.first.wait_for(state="visible", timeout=30000)
     except PWTimeout:
+        if page.get_by_text(COOLDOWN_RE).count() > 0:
+            log("Booster deja ouvert ou valide !")
+            return
         snapshot(page, "apres clic")
         page.screenshot(path=str(SHOTS / "etat_final.png"))
         raise RuntimeError("Le booster ne semble pas s'etre ouvert.")

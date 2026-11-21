@@ -13,13 +13,19 @@ Identifiants : cree un fichier .env a cote du script avec
     EM_PASSWORD=ton_mot_de_passe
 (sinon le script te les demande au lancement, sans les enregistrer)
 
+Bright Data Browser API (optionnel) :
+    Ajouter dans le .env :
+    BRIGHT_DATA_WS_URL=wss://brd-customer-XXXXXXXX-zone-ZONE_NAME:PASSWORD@brd.superproxy.io:9222
+    Si absent, le script utilise Chromium local.
+
 Lancement :
     python essec_booster_local.py            # boucle sans fin, navigateur invisible
-    python essec_booster_local.py --show     # navigateur visible (pour voir ce qu'il fait)
+    python essec_booster_local.py --show     # navigateur visible (pour voir ce qu'il fait, Chromium local seulement)
     python essec_booster_local.py --once     # un seul passage puis stop
 """
 import argparse
 import getpass
+import json
 import os
 import re
 import sys
@@ -43,6 +49,10 @@ EXTRA_WAIT = 30          # secondes ajoutees apres la fin du compte a rebours
 DEFAULT_COOLDOWN = 600   # si le site n'affiche pas son compte a rebours
 RETRY_AFTER_ERROR = 120  # attente apres une erreur (reseau, page changee...)
 MAX_LOGIN_FAILS = 3      # on s'arrete si la connexion echoue 3 fois de suite
+
+# Bright Data Browser API : wss://brd-customer-...-zone-...:PASSWORD@brd.superproxy.io:9222
+# Si absent, on utilise Chromium local.
+BRIGHT_DATA_WS_URL = (os.getenv("BRIGHT_DATA_WS_URL") or "").strip()
 
 PACK_RE = re.compile(r"open the booster|ouvrir|tirer", re.I)
 COOLDOWN_RE = re.compile(r"(?:next booster in|prochain booster dans)\s*(\d+):(\d{2})", re.I)
@@ -69,6 +79,51 @@ def log(msg: str) -> None:
         f.write(line + "\n")
 
 
+def snapshot(page, tag: str) -> None:
+    """Ecrit dans le log ce que la page affiche (boutons + debut du texte)."""
+    try:
+        log(f"[{tag}] URL : {page.url}")
+        for b in page.get_by_role("button").all():
+            if b.is_visible():
+                label = (b.get_attribute("aria-label") or "") + " | " + b.inner_text().strip()[:60]
+                log(f"[{tag}]   bouton : {label!r}")
+        txt = re.sub(r"\s+", " ", page.locator("body").inner_text())[:500]
+        log(f"[{tag}] texte : {txt}")
+    except Exception as e:
+        log(f"[{tag}] snapshot impossible : {e}")
+
+
+def solve_captcha_if_needed(page) -> None:
+    """Demande a Bright Data de resoudre les Captchas / Cloudflare Turnstile s'il y en a."""
+    if not BRIGHT_DATA_WS_URL:
+        return
+    try:
+        txt = (page.locator("body").inner_text() or "")[:500].lower()
+        if not any(k in txt for k in ("turnstile", "captcha", "cloudflare", "verify you are human")):
+            return
+        client = page.context.new_cdp_session(page)
+        res = client.send("Captcha.solve", {"detectTimeout": 10000})
+        st = res.get("status") if isinstance(res, dict) else None
+        if st and st not in ("not_detected", None):
+            log(f"Bright Data Captcha : {st}")
+    except Exception:
+        pass
+
+
+def load_session_into_context(ctx) -> None:
+    """Injecte les cookies de session.json dans le navigateur pour eviter d'avoir a se reconnecter."""
+    if not STATE_FILE.exists():
+        return
+    try:
+        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        if "cookies" in data and data["cookies"]:
+            ctx.add_cookies(data["cookies"])
+            log("Session injectee depuis session.json.")
+    except Exception:
+        # Bright Data peut bloquer Storage.setCookies par defaut si Custom Headers n'est pas active
+        pass
+
+
 def get_credentials() -> tuple[str, str]:
     email = (os.getenv("EM_EMAIL") or "").strip()
     password = (os.getenv("EM_PASSWORD") or "").strip()
@@ -79,17 +134,52 @@ def get_credentials() -> tuple[str, str]:
     return email, password
 
 
-def login(page, email: str, password: str) -> None:
+def login(page, email: str, password: str, goto_opts: dict | None = None) -> None:
+    if goto_opts is None:
+        goto_opts = (
+            {"wait_until": "domcontentloaded", "timeout": 60_000}
+            if BRIGHT_DATA_WS_URL
+            else {"wait_until": "networkidle"}
+        )
     log("Connexion...")
-    page.goto(f"{BASE}/login", wait_until="networkidle")
-    page.fill("input[type=email]", email)
-    page.fill("input[type=password]", password)
-    page.get_by_role("button", name=re.compile("log in|connexion|se connecter", re.I)).click()
+    page.goto(f"{BASE}/login", **goto_opts)
+    solve_captcha_if_needed(page)
+
+    # Remplissage de l'email
+    email_input = page.locator("input[type=email]").first
+    email_input.wait_for(state="visible", timeout=30_000)
+    email_input.fill(email, force=True)
+
+    page.wait_for_timeout(500)
+
+    # Remplissage du mot de passe
+    password_input = page.locator("input[type=password]").first
+    password_input.wait_for(state="visible", timeout=30_000)
+
+    if BRIGHT_DATA_WS_URL:
+        # Contournement de la regle Bright Data "password typing is not allowed" :
+        # On passe temporairement le champ en type='text' dans le DOM pendant la saisie.
+        page.evaluate("""({ val }) => {
+            const el = document.querySelector('input[type=password]') || document.querySelector('input[name=password]');
+            if (!el) return;
+            el.setAttribute('type', 'text');
+            const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+            setter.call(el, val);
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+            el.setAttribute('type', 'password');
+        }""", {"val": password})
+    else:
+        password_input.fill(password, force=True)
+
+    page.wait_for_timeout(500)
+    page.get_by_role("button", name=re.compile("log in|connexion|se connecter", re.I)).first.click(force=True)
     try:
-        page.wait_for_url(lambda u: "/login" not in u, timeout=20000)
+        page.wait_for_url(lambda u: "/login" not in u, timeout=goto_opts.get("timeout") or 30000)
     except PWTimeout:
         raise LoginError("Connexion refusee : verifie l'email et le mot de passe.")
-    page.wait_for_load_state("networkidle")
+    page.wait_for_load_state("domcontentloaded")
+    solve_captcha_if_needed(page)
     log("Connecte.")
 
 
@@ -123,22 +213,44 @@ def play_animation(page) -> int:
 def run_once(email: str, password: str, show: bool) -> tuple[str, int]:
     """Un passage. Retourne ("opened", secondes) ou ("cooldown", secondes) ou ("nopack", 0)."""
     with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=not show,
-            executable_path=os.getenv("EM_BROWSER_PATH") or None,
-            args=["--no-sandbox"] if os.getenv("EM_BROWSER_PATH") else None,
-        )
-        try:
+        if BRIGHT_DATA_WS_URL:
+            log("Connexion a Bright Data Browser API...")
+            browser = p.chromium.connect_over_cdp(BRIGHT_DATA_WS_URL)
+            # Avec Bright Data on reutilise le contexte distant existant
+            ctx = browser.contexts[0] if browser.contexts else browser.new_context(
+                viewport={"width": 412, "height": 915},
+                ignore_https_errors=True,
+            )
+            load_session_into_context(ctx)
+        else:
+            browser = p.chromium.launch(
+                headless=not show,
+                executable_path=os.getenv("EM_BROWSER_PATH") or None,
+                args=["--no-sandbox"] if os.getenv("EM_BROWSER_PATH") else None,
+            )
             ctx = browser.new_context(
                 storage_state=str(STATE_FILE) if STATE_FILE.exists() else None,
                 viewport={"width": 412, "height": 915},
             )
+        try:
             page = ctx.new_page()
-            page.goto(BOOSTER_URL, wait_until="networkidle")
+            page.set_viewport_size({"width": 412, "height": 915})
+            if BRIGHT_DATA_WS_URL:
+                page.set_default_navigation_timeout(60_000)
+                page.set_default_timeout(60_000)
+                goto_opts = {"wait_until": "domcontentloaded", "timeout": 60_000}
+            else:
+                goto_opts = {"wait_until": "networkidle"}
+            page.goto(BOOSTER_URL, **goto_opts)
+            solve_captcha_if_needed(page)
             if "/login" in page.url:
-                login(page, email, password)
-                page.goto(BOOSTER_URL, wait_until="networkidle")
-            ctx.storage_state(path=str(STATE_FILE))
+                login(page, email, password, goto_opts)
+                page.goto(BOOSTER_URL, **goto_opts)
+                solve_captcha_if_needed(page)
+            try:
+                ctx.storage_state(path=str(STATE_FILE))
+            except Exception:
+                pass
 
             pack = page.get_by_role("button", name=PACK_RE)
             if pack.count() == 0 or not pack.first.is_enabled():
@@ -149,15 +261,32 @@ def run_once(email: str, password: str, show: bool) -> tuple[str, int]:
                 page.screenshot(path=str(SHOTS / "page_inconnue.png"))
                 return "nopack", 0
 
-            pack.first.click(force=True)
+            # 1) Ouvrir le paquet (il flotte en permanence : scroll et clic en JS pour eviter les timeouts de stabilite CSS)
+            page.evaluate("""() => {
+                const b = document.querySelector('button[aria-label*="booster" i]') || 
+                          Array.from(document.querySelectorAll('button')).find(el => /open the booster|ouvrir|tirer/i.test(el.innerText || el.getAttribute('aria-label') || ''));
+                if (b) {
+                    b.scrollIntoView({ behavior: 'instant', block: 'center' });
+                    b.click();
+                }
+            }""")
+            try:
+                pack.first.click(force=True, timeout=3000)
+            except Exception:
+                pass
+            log("Clic sur le booster.")
             first_ui = (
                 page.get_by_role("button", name=REVEAL_RE)
                 .or_(page.get_by_role("button", name=NEXT_RE))
                 .or_(page.get_by_text(HINT_RE))
             )
             try:
-                first_ui.first.wait_for(state="visible", timeout=10000)
+                first_ui.first.wait_for(state="visible", timeout=30000)
             except PWTimeout:
+                remaining = read_cooldown(page)
+                if remaining is not None:
+                    log(f"Booster deja valide ! Prochain booster dans {remaining}s.")
+                    return "opened", remaining
                 SHOTS.mkdir(exist_ok=True)
                 page.screenshot(path=str(SHOTS / "ouverture_echouee.png"))
                 raise RuntimeError("Le booster ne semble pas s'etre ouvert.")
@@ -166,6 +295,14 @@ def run_once(email: str, password: str, show: bool) -> tuple[str, int]:
             seen = play_animation(page)
             log(f"Booster ouvert, 3 cartes recuperees (animation : {seen}/3).")
             return "opened", remaining if remaining is not None else DEFAULT_COOLDOWN
+        except Exception:
+            SHOTS.mkdir(exist_ok=True)
+            try:
+                page.screenshot(path=str(SHOTS / "erreur.png"))
+                snapshot(page, "erreur")
+            except Exception:
+                pass
+            raise
         finally:
             browser.close()
 

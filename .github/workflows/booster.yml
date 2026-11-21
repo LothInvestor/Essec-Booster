@@ -27,6 +27,7 @@ jobs:
         env:
           EM_EMAIL: ${{ secrets.EM_EMAIL }}
           EM_PASSWORD: ${{ secrets.EM_PASSWORD }}
+          BRIGHT_DATA_WS_URL: ${{ secrets.BRIGHT_DATA_WS_URL }}
       - uses: actions/upload-artifact@v4
         if: always()
         with:

@@ -1,5 +1,6 @@
 session.json
 screenshots/
 booster_bot.log
+debug.log
 __pycache__/
 .env
