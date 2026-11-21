@@ -218,7 +218,7 @@ def _run(page, ctx, debug: bool) -> None:
             page.screenshot(path=str(SHOTS / "etat_page.png"))
         return
 
-    # 1) Ouvrir le paquet (il flotte en permanence : scroll et clic en JS pour eviter les timeouts de stabilite CSS)
+    # 1) Ouvrir le paquet (scroll et clic en JS pour eviter les timeouts de stabilite CSS)
     page.evaluate("""() => {
         const b = document.querySelector('button[aria-label*="booster" i]') || 
                   Array.from(document.querySelectorAll('button')).find(el => /open the booster|ouvrir|tirer/i.test(el.innerText || el.getAttribute('aria-label') || ''));
@@ -227,10 +227,6 @@ def _run(page, ctx, debug: bool) -> None:
             b.click();
         }
     }""")
-    try:
-        pack.first.click(force=True, timeout=3000)
-    except Exception:
-        pass
     log("Clic sur le booster.")
     first_ui = (
         page.get_by_role("button", name=REVEAL_RE)
@@ -242,6 +238,11 @@ def _run(page, ctx, debug: bool) -> None:
     except PWTimeout:
         if page.get_by_text(COOLDOWN_RE).count() > 0:
             log("Booster deja ouvert ou valide !")
+            return
+        body_txt = (page.locator("body").inner_text() or "").lower()
+        if "opening" in body_txt or "ouverture" in body_txt:
+            log("Booster en cours d'ouverture (Opening... detecte), les cartes sont attribuees.")
+            page.wait_for_timeout(5000)
             return
         snapshot(page, "apres clic")
         page.screenshot(path=str(SHOTS / "etat_final.png"))

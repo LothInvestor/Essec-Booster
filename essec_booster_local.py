@@ -261,7 +261,7 @@ def run_once(email: str, password: str, show: bool) -> tuple[str, int]:
                 page.screenshot(path=str(SHOTS / "page_inconnue.png"))
                 return "nopack", 0
 
-            # 1) Ouvrir le paquet (il flotte en permanence : scroll et clic en JS pour eviter les timeouts de stabilite CSS)
+            # 1) Ouvrir le paquet (scroll et clic en JS pour eviter les timeouts de stabilite CSS)
             page.evaluate("""() => {
                 const b = document.querySelector('button[aria-label*="booster" i]') || 
                           Array.from(document.querySelectorAll('button')).find(el => /open the booster|ouvrir|tirer/i.test(el.innerText || el.getAttribute('aria-label') || ''));
@@ -270,10 +270,6 @@ def run_once(email: str, password: str, show: bool) -> tuple[str, int]:
                     b.click();
                 }
             }""")
-            try:
-                pack.first.click(force=True, timeout=3000)
-            except Exception:
-                pass
             log("Clic sur le booster.")
             first_ui = (
                 page.get_by_role("button", name=REVEAL_RE)
@@ -287,6 +283,14 @@ def run_once(email: str, password: str, show: bool) -> tuple[str, int]:
                 if remaining is not None:
                     log(f"Booster deja valide ! Prochain booster dans {remaining}s.")
                     return "opened", remaining
+                # Si le texte affiche "Opening...", le tirage a ete effectue cote serveur
+                body_txt = (page.locator("body").inner_text() or "").lower()
+                if "opening" in body_txt or "ouverture" in body_txt:
+                    log("Booster en cours d'ouverture (Opening... detecte), les cartes sont attribuees.")
+                    page.wait_for_timeout(5000)
+                    seen = play_animation(page)
+                    remaining = read_cooldown(page)
+                    return "opened", remaining if remaining is not None else DEFAULT_COOLDOWN
                 SHOTS.mkdir(exist_ok=True)
                 page.screenshot(path=str(SHOTS / "ouverture_echouee.png"))
                 raise RuntimeError("Le booster ne semble pas s'etre ouvert.")
