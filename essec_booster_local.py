@@ -93,23 +93,6 @@ def snapshot(page, tag: str) -> None:
         log(f"[{tag}] snapshot impossible : {e}")
 
 
-def solve_captcha_if_needed(page) -> None:
-    """Demande a Bright Data de resoudre les Captchas / Cloudflare Turnstile s'il y en a."""
-    if not BRIGHT_DATA_WS_URL:
-        return
-    try:
-        txt = (page.locator("body").inner_text() or "")[:500].lower()
-        if not any(k in txt for k in ("turnstile", "captcha", "cloudflare", "verify you are human")):
-            return
-        client = page.context.new_cdp_session(page)
-        res = client.send("Captcha.solve", {"detectTimeout": 10000})
-        st = res.get("status") if isinstance(res, dict) else None
-        if st and st not in ("not_detected", None):
-            log(f"Bright Data Captcha : {st}")
-    except Exception:
-        pass
-
-
 def load_session_into_context(ctx) -> None:
     """Injecte les cookies de session.json dans le navigateur pour eviter d'avoir a se reconnecter."""
     if not STATE_FILE.exists():
@@ -143,7 +126,6 @@ def login(page, email: str, password: str, goto_opts: dict | None = None) -> Non
         )
     log("Connexion...")
     page.goto(f"{BASE}/login", **goto_opts)
-    solve_captcha_if_needed(page)
 
     # Remplissage de l'email
     email_input = page.locator("input[type=email]").first
@@ -179,7 +161,6 @@ def login(page, email: str, password: str, goto_opts: dict | None = None) -> Non
     except PWTimeout:
         raise LoginError("Connexion refusee : verifie l'email et le mot de passe.")
     page.wait_for_load_state("domcontentloaded")
-    solve_captcha_if_needed(page)
     log("Connecte.")
 
 
@@ -242,11 +223,9 @@ def run_once(email: str, password: str, show: bool) -> tuple[str, int]:
             else:
                 goto_opts = {"wait_until": "networkidle"}
             page.goto(BOOSTER_URL, **goto_opts)
-            solve_captcha_if_needed(page)
             if "/login" in page.url:
                 login(page, email, password, goto_opts)
                 page.goto(BOOSTER_URL, **goto_opts)
-                solve_captcha_if_needed(page)
             try:
                 ctx.storage_state(path=str(STATE_FILE))
             except Exception:
@@ -279,26 +258,31 @@ def run_once(email: str, password: str, show: bool) -> tuple[str, int]:
             try:
                 first_ui.first.wait_for(state="visible", timeout=30000)
             except PWTimeout:
+                body_txt = page.locator("body").inner_text() or ""
+                if "anti-robot" in body_txt.lower():
+                    SHOTS.mkdir(exist_ok=True)
+                    page.screenshot(path=str(SHOTS / "anti_robot.png"))
+                    raise RuntimeError("Le site bloque l'ouverture avec sa verification anti-robot ('The anti-robot check didn\\'t go through').")
                 remaining = read_cooldown(page)
                 if remaining is not None:
                     log(f"Booster deja valide ! Prochain booster dans {remaining}s.")
                     return "opened", remaining
-                # Si le texte affiche "Opening...", le tirage a ete effectue cote serveur
-                body_txt = (page.locator("body").inner_text() or "").lower()
-                if "opening" in body_txt or "ouverture" in body_txt:
-                    log("Booster en cours d'ouverture (Opening... detecte), les cartes sont attribuees.")
-                    page.wait_for_timeout(5000)
-                    seen = play_animation(page)
-                    remaining = read_cooldown(page)
-                    return "opened", remaining if remaining is not None else DEFAULT_COOLDOWN
                 SHOTS.mkdir(exist_ok=True)
                 page.screenshot(path=str(SHOTS / "ouverture_echouee.png"))
                 raise RuntimeError("Le booster ne semble pas s'etre ouvert.")
 
-            remaining = read_cooldown(page)
             seen = play_animation(page)
-            log(f"Booster ouvert, 3 cartes recuperees (animation : {seen}/3).")
-            return "opened", remaining if remaining is not None else DEFAULT_COOLDOWN
+            remaining = read_cooldown(page)
+            if seen > 0:
+                log(f"Booster ouvert, 3 cartes recuperees (animation : {seen}/3).")
+                return "opened", remaining if remaining is not None else DEFAULT_COOLDOWN
+            elif remaining is not None:
+                log(f"Booster valide cote serveur. Prochain booster dans {remaining}s.")
+                return "opened", remaining
+            else:
+                SHOTS.mkdir(exist_ok=True)
+                page.screenshot(path=str(SHOTS / "cartes_non_vues.png"))
+                raise RuntimeError("Le booster ne semble pas avoir ete attribue (aucune carte vue et pas de compte a rebours).")
         except Exception:
             SHOTS.mkdir(exist_ok=True)
             try:
